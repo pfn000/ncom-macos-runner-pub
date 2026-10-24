@@ -4,6 +4,12 @@ run-name: "macrun ${{ inputs.script }} [${{ inputs.req }}]"
 # token, nothing private. The dmg arrives AES-256 encrypted via a short-lived signed URL (~1h, minted off-box
 # from the private HF store) and is decrypted in-runner with the narrow DMG_KEY secret. Only command output
 # (e.g. ictool --help text) ever leaves the runner as an artifact.
+#
+# IMPORTANT: inputs.dmg_url must NEVER be interpolated with ${{ }} directly inside a `run:` script body.
+# GitHub prints the fully-substituted script text as the step's "Run ..." log header BEFORE any ::add-mask::
+# inside that same script takes effect, so a direct ${{ inputs.dmg_url }} in a run: line leaks the whole URL
+# in plain text in this PUBLIC repo's log. The only safe pattern: pass it through `env:` and reference it as
+# a shell variable ($URL), then mask that variable as the very first line of the step that uses it.
 on:
   workflow_dispatch:
     inputs:
@@ -37,9 +43,6 @@ jobs:
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 20
     steps:
-      - name: Mask the signed URL
-        run: |
-          echo "::add-mask::${{ inputs.dmg_url }}"
       - uses: actions/checkout@v4
       - name: Host facts
         run: |
