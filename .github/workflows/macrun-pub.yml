@@ -1,0 +1,92 @@
+name: macrun-pub
+run-name: "macrun ${{ inputs.script }} [${{ inputs.req }}]"
+# NCOM macOS runner lane, PUBLIC variant. This repo holds only this workflow and a README — no dmg, no HF
+# token, nothing private. The dmg arrives AES-256 encrypted via a short-lived signed URL (~1h, minted off-box
+# from the private HF store) and is decrypted in-runner with the narrow DMG_KEY secret. Only command output
+# (e.g. ictool --help text) ever leaves the runner as an artifact.
+on:
+  workflow_dispatch:
+    inputs:
+      dmg_url:
+        description: "short-lived signed URL of the AES-256 ENCRYPTED dmg (minted by macrun_pub.py; expires ~1 h)"
+        required: true
+      sha256:
+        description: "expected sha256 of the PLAINTEXT dmg (blank = skip check)"
+        required: false
+        default: ""
+      script:
+        description: "script in scripts/ (without .sh) run with APP, MNT, OUT set; or 'cmd' to run the cmd input"
+        required: true
+        default: "ictool"
+      cmd:
+        description: "shell command when script=cmd (runs with APP, MNT, OUT set)"
+        required: false
+        default: ""
+      req:
+        description: "request id (set by macrun_pub.py to find this run)"
+        required: false
+        default: manual
+      runner:
+        description: "runner label"
+        required: false
+        default: "macos-26"
+permissions:
+  contents: read
+jobs:
+  run:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 20
+    steps:
+      - name: Mask the signed URL
+        run: |
+          echo "::add-mask::${{ inputs.dmg_url }}"
+      - uses: actions/checkout@v4
+      - name: Host facts
+        run: |
+          mkdir -p out
+          { sw_vers; uname -a; sysctl -n machdep.cpu.brand_string; xcode-select -p; xcodebuild -version 2>/dev/null | head -2; } 2>&1 | tee out/host.txt
+      - name: Fetch + decrypt dmg (ciphertext and key only ever touch this run; never committed, never logged)
+        env:
+          DMG_KEY: ${{ secrets.DMG_KEY }}
+          URL: ${{ inputs.dmg_url }}
+          SHA: ${{ inputs.sha256 }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$URL"
+          curl -fsSL --retry 4 -o "$RUNNER_TEMP/in.enc" "$URL"
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:DMG_KEY -in "$RUNNER_TEMP/in.enc" -out "$RUNNER_TEMP/in.dmg"
+          rm -f "$RUNNER_TEMP/in.enc"
+          got=$(shasum -a 256 "$RUNNER_TEMP/in.dmg" | cut -d' ' -f1)
+          echo "dmg=encrypted-input sha256=$got bytes=$(stat -f%z "$RUNNER_TEMP/in.dmg")" | tee out/dmg.txt
+          if [ -n "$SHA" ] && [ "$got" != "$SHA" ]; then echo "sha256 mismatch (want $SHA)"; exit 3; fi
+      - name: Mount dmg
+        run: |
+          set -euo pipefail
+          MNT="$RUNNER_TEMP/dmgmnt"; mkdir -p "$MNT"
+          yes | hdiutil attach -nobrowse -readonly -noautoopen -mountpoint "$MNT" "$RUNNER_TEMP/in.dmg" | tee out/mount.txt
+          APP=$(find "$MNT" -maxdepth 2 -name "*.app" -type d | head -1)
+          echo "MNT=$MNT" >> "$GITHUB_ENV"; echo "APP=$APP" >> "$GITHUB_ENV"
+          echo "app=$APP" | tee -a out/mount.txt
+          [ -n "$APP" ] && /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP/Contents/Info.plist" | tee -a out/mount.txt || true
+      - name: Run
+        env:
+          SCRIPT: ${{ inputs.script }}
+          CMD: ${{ inputs.cmd }}
+        run: |
+          set -o pipefail
+          export OUT="$GITHUB_WORKSPACE/out"
+          case "$SCRIPT" in *[!A-Za-z0-9_-]*) echo "bad script name"; exit 2;; esac
+          start=$(date +%s)
+          if [ "$SCRIPT" = cmd ]; then bash -c "$CMD" 2>&1 | tee "$OUT/run.log"; rc=$?
+          else bash "scripts/$SCRIPT.sh" 2>&1 | tee "$OUT/run.log"; rc=$?; fi
+          echo "run_seconds=$(( $(date +%s) - start )) exit=$rc" | tee -a "$OUT/run.log"
+          exit $rc
+      - name: Unmount
+        if: always()
+        run: hdiutil detach "$MNT" -force || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macrun-pub-${{ inputs.req }}
+          path: out/
+          retention-days: 1
