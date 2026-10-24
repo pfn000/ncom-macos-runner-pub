@@ -64,9 +64,17 @@ jobs:
           if [ -n "$SHA" ] && [ "$got" != "$SHA" ]; then echo "sha256 mismatch (want $SHA)"; exit 3; fi
       - name: Mount dmg
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          # NOTE (fix, found on a real run): "yes | hdiutil ... | tee" under `set -o pipefail` fails the step
+          # with SIGPIPE (141) the instant hdiutil exits and stops reading stdin, even though the mount itself
+          # succeeded -- `yes` never gets to finish, pipefail sees its non-zero exit, `-e` would abort the
+          # script. Fixed: no infinite pipe into hdiutil (its stdin is just closed; this dmg showed no license
+          # prompt in practice), and hdiutil's own exit code is checked explicitly instead of relying on `-e`.
           MNT="$RUNNER_TEMP/dmgmnt"; mkdir -p "$MNT"
-          yes | hdiutil attach -nobrowse -readonly -noautoopen -mountpoint "$MNT" "$RUNNER_TEMP/in.dmg" | tee out/mount.txt
+          hdiutil attach -nobrowse -readonly -noautoopen -mountpoint "$MNT" "$RUNNER_TEMP/in.dmg" < /dev/null > out/mount.txt 2>&1
+          rc=$?
+          cat out/mount.txt
+          if [ "$rc" -ne 0 ]; then echo "hdiutil attach failed, exit=$rc"; exit "$rc"; fi
           APP=$(find "$MNT" -maxdepth 2 -name "*.app" -type d | head -1)
           echo "MNT=$MNT" >> "$GITHUB_ENV"; echo "APP=$APP" >> "$GITHUB_ENV"
           echo "app=$APP" | tee -a out/mount.txt
